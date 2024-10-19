@@ -1,0 +1,13 @@
+[package]
+name = "freeq"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ori-vst = { git = "https://github.com/ori-ui/ori-vst" }
+ori = { git = "https://github.com/ori-ui/ori", default-features = false }
+
+num = "0.4"
