@@ -7,7 +7,9 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-ori-vst = { git = "https://github.com/ori-ui/ori-vst" }
-ori = { git = "https://github.com/ori-ui/ori", default-features = false }
+#ori-vst = { git = "https://github.com/ori-ui/ori-vst" }
+
+ori-vst = { path = "../ori-vst" }
 
 num = "0.4"
+realfft = "3.4"

@@ -1,5 +1,9 @@
+use std::{f32::consts::PI, sync::Arc};
+
 use filter::{Filter, FilterState};
+use num::Complex;
 use ori_vst::prelude::*;
+use realfft::{RealFftPlanner, RealToComplex};
 
 mod filter;
 
@@ -9,9 +13,21 @@ pub struct FreeqParams {
     filters: [Filter; 10],
 }
 
+vst3!(Freeq);
+
 pub struct Freeq {
     params: FreeqParams,
     filters: [[FilterState; 10]; 2],
+    fft: Arc<dyn RealToComplex<f32>>,
+    prev_input: f32,
+    prev_output: f32,
+    buffer_a: Vec<f32>,
+    buffer_b: Vec<f32>,
+    complex: Vec<Complex<f32>>,
+    scratch: Vec<Complex<f32>>,
+    spectrum: Vec<f32>,
+    current: usize,
+    sample_rate: f32,
 }
 
 impl VstPlugin for Freeq {
@@ -35,7 +51,7 @@ impl VstPlugin for Freeq {
     }
 
     fn window() -> Window {
-        Window::new().title("FreeQ").size(600, 400)
+        Window::new().title("FreeQ").size(640, 500).resizable(false)
     }
 
     fn new() -> Self {
@@ -55,6 +71,16 @@ impl VstPlugin for Freeq {
                 ],
             },
             filters: Default::default(),
+            fft: RealFftPlanner::new().plan_fft_forward(Self::FFT_SIZE),
+            prev_input: 0.0,
+            prev_output: 0.0,
+            buffer_a: vec![0.0; Self::FFT_SIZE],
+            buffer_b: vec![0.0; Self::FFT_SIZE],
+            complex: vec![Complex::new(0.0, 0.0); Self::FFT_SIZE / 2 + 1],
+            scratch: vec![Complex::new(0.0, 0.0); Self::FFT_SIZE / 2 + 1],
+            spectrum: vec![0.0; Self::FFT_SIZE / 2 + 1],
+            current: 0,
+            sample_rate: 44100.0,
         }
     }
 
@@ -63,10 +89,21 @@ impl VstPlugin for Freeq {
     }
 
     fn ui(&mut self) -> impl View<Self> + 'static {
-        curve_view(self)
+        let mut filters = Vec::new();
+
+        for i in 0..self.params.filters.len() {
+            let filter = filter_options(self, i);
+            filters.push(filter);
+        }
+
+        let filters = hstack(filters);
+
+        vstack![flex(curve_view(self)), filters].align(Align::Start)
     }
 
-    fn activate(&mut self, _audio_layout: &AudioLayout, _buffer_layout: &BufferLayout) -> Activate {
+    fn activate(&mut self, _audio_layout: &AudioLayout, buffer_layout: &BufferLayout) -> Activate {
+        self.sample_rate = buffer_layout.sample_rate;
+
         Activate::new()
     }
 
@@ -83,10 +120,35 @@ impl VstPlugin for Freeq {
         }
 
         for samples in buffer.iter_samples() {
+            let mut average = 0.0;
+
             for (sample, filters) in samples.zip(self.filters.iter_mut()) {
                 for filter in filters.iter_mut() {
                     *sample = filter.process(*sample);
                 }
+
+                average += *sample;
+            }
+
+            average /= buffer.channels() as f32;
+
+            // apply high-pass filter to remove DC offset
+            let high_pass = 0.999 * (self.prev_output + average - self.prev_input);
+            self.prev_input = average;
+            self.prev_output = high_pass;
+
+            let i_a = self.current;
+            let i_b = (self.current + self.buffer_a.len() / 2) % self.buffer_a.len();
+
+            self.buffer_a[i_a] = high_pass;
+            self.buffer_b[i_b] = high_pass;
+            self.current += 1;
+            self.current %= self.buffer_a.len();
+
+            if self.current == 0 {
+                self.compute_fft(false);
+            } else if self.current == self.buffer_a.len() / 2 {
+                self.compute_fft(true);
             }
         }
 
@@ -94,9 +156,62 @@ impl VstPlugin for Freeq {
     }
 }
 
-vst3!(Freeq);
+impl Freeq {
+    pub const FFT_SIZE: usize = 4096;
 
-const CONTROL_RADIUS: f32 = 6.0;
+    fn hann_window(i: usize, n: usize) -> f32 {
+        0.5 * (1.0 - f32::cos(2.0 * PI * i as f32 / (n - 1) as f32))
+    }
+
+    pub fn compute_fft(&mut self, is_b: bool) {
+        let buffer = if is_b {
+            &mut self.buffer_b
+        } else {
+            &mut self.buffer_a
+        };
+
+        // apply window function
+        for (i, sample) in buffer.iter_mut().enumerate() {
+            *sample *= Self::hann_window(i, Self::FFT_SIZE);
+        }
+
+        self.fft
+            .process_with_scratch(buffer, &mut self.complex, &mut self.scratch)
+            .unwrap();
+
+        let norm = f32::powf(2.0, 2.0 / Self::FFT_SIZE as f32);
+
+        for (spectrum, complex) in self.spectrum.iter_mut().zip(self.complex.iter()) {
+            let magnitude = complex.norm() * norm;
+            let magnitude = magnitude.max(1.0e-6);
+
+            *spectrum *= 0.6;
+            *spectrum += magnitude * 0.4;
+        }
+    }
+
+    fn spectrum_x(&self, i: usize, rect: Rect) -> f32 {
+        let freq = i as f32 * self.sample_rate / Self::FFT_SIZE as f32 + 1.0;
+        freq_to_x(freq, rect)
+    }
+
+    fn spectrum_y(&self, i: usize, rect: Rect) -> f32 {
+        let freq = i as f32 * self.sample_rate / Self::FFT_SIZE as f32 + 1.0e-3;
+
+        let pink_noise = 3.0 * (f32::log10(freq / 20.0) / f32::log10(2.0));
+
+        let spectrum = self.spectrum[i];
+
+        let gain = 20.0 * f32::log10(spectrum + 1.0e-6);
+        let gain = gain + pink_noise;
+        let gain = gain / 80.0;
+
+        rect.bottom() - gain * rect.height()
+    }
+}
+
+const CONTROL_RADIUS: f32 = 8.0;
+const SPLINE_TENSION: f32 = 0.2;
 
 const GAIN_LINES: &[f32] = &[-18.0, -12.0, -6.0, 0.0, 6.0, 12.0, 18.0];
 
@@ -115,9 +230,9 @@ struct CurveView {
     selected: Option<usize>,
 }
 
-fn curve_view(_eqo: &mut Freeq) -> impl View<Freeq> {
-    with_state_default(|_state, _eqo| {
-        let view = painter(|cx, (_state, eqo): &mut (CurveView, Freeq)| {
+fn curve_view(_data: &mut Freeq) -> impl View<Freeq> {
+    with_state_default(|_state, _data| {
+        let view = painter(|cx, (_state, data): &mut (CurveView, Freeq)| {
             let styles = cx.styles();
             let line_color = styles.get(Theme::OUTLINE).unwrap();
             let label_color = styles.get(Theme::CONTRAST_LOW).unwrap();
@@ -171,7 +286,63 @@ fn curve_view(_eqo: &mut Freeq) -> impl View<Freeq> {
             }
 
             cx.masked(rect, |cx| {
-                for (i, filter) in eqo.params.filters.iter().enumerate() {
+                let mut points: Vec<Point> = Vec::with_capacity(data.spectrum.len());
+
+                for i in 0..data.spectrum.len() {
+                    let x = data.spectrum_x(i, rect);
+                    let y = data.spectrum_y(i, rect);
+
+                    let point = Point::new(x, y);
+
+                    if let Some(last) = points.last_mut() {
+                        if last.x.floor() == point.x.floor() {
+                            last.y = f32::max(last.y, point.y);
+                            continue;
+                        }
+                    }
+
+                    points.push(point);
+                }
+
+                let mut curve = Curve::default();
+
+                curve.move_to(rect.bottom_left());
+
+                for i in 1..points.len() {
+                    let a = match i == 1 {
+                        true => points[0],
+                        false => {
+                            let p0 = points[i - 2];
+                            let p1 = points[i - 1];
+                            let p2 = points[i];
+
+                            p1 + (p2 - p0) * SPLINE_TENSION
+                        }
+                    };
+
+                    let b = match i == points.len() - 1 {
+                        true => points[i],
+                        false => {
+                            let p0 = points[i - 1];
+                            let p1 = points[i];
+                            let p2 = points[i + 1];
+
+                            p1 - (p2 - p0) * SPLINE_TENSION
+                        }
+                    };
+
+                    let c = points[i];
+
+                    curve.cubic_to(a, b, c);
+                }
+
+                curve.line_to(rect.bottom_right());
+                curve.close();
+
+                cx.fill(curve.clone(), FillRule::NonZero, contrast_color.fade(0.1));
+                cx.stroke(curve, 1.0, contrast_color.fade(0.5));
+
+                for (i, filter) in data.params.filters.iter().enumerate() {
                     let mut curve = Curve::default();
 
                     curve.move_to(rect.center_left());
@@ -208,7 +379,7 @@ fn curve_view(_eqo: &mut Freeq) -> impl View<Freeq> {
 
                     let mut gain = 0.0;
 
-                    for filter in eqo.params.filters.iter() {
+                    for filter in data.params.filters.iter() {
                         gain += filter.gain_at(freq, 24000.0 + frac * 24000.0);
                     }
 
@@ -225,7 +396,7 @@ fn curve_view(_eqo: &mut Freeq) -> impl View<Freeq> {
 
                 cx.stroke(curve, 2.0, contrast_color);
 
-                for (i, filter) in eqo.params.filters.iter_mut().enumerate() {
+                for (i, filter) in data.params.filters.iter_mut().enumerate() {
                     let center = filter_center(filter, rect);
                     let color = filter_color(i, 10);
 
@@ -234,22 +405,29 @@ fn curve_view(_eqo: &mut Freeq) -> impl View<Freeq> {
                         FillRule::NonZero,
                         color,
                     );
+
+                    cx.fill(
+                        Curve::circle(center, CONTROL_RADIUS - 2.0),
+                        FillRule::NonZero,
+                        color.darken(0.3).desaturate(0.2),
+                    );
                 }
             });
 
             cx.stroke(Curve::rect(rect), 1.0, line_color);
         });
 
-        on_event(
-            view,
-            |cx, (state, eqo): &mut (CurveView, Freeq), event| match event {
+        on_event(view, |cx, (state, data): &mut (CurveView, Freeq), event| {
+            cx.animate();
+
+            match event {
                 Event::PointerPressed(e) => {
                     let local = cx.local(e.position);
                     let rect = curve_view_rect(cx.rect());
 
                     let mut selected = None;
 
-                    for (i, filter) in eqo.params.filters.iter().enumerate() {
+                    for (i, filter) in data.params.filters.iter().enumerate() {
                         let center = filter_center(filter, rect);
 
                         if center.distance(local) < CONTROL_RADIUS {
@@ -268,7 +446,7 @@ fn curve_view(_eqo: &mut Freeq) -> impl View<Freeq> {
                             true
                         }
                         PointerButton::Secondary => {
-                            eqo.params.filters[selected] = Filter::new(selected as u32, 10);
+                            data.params.filters[selected] = Filter::new(selected as u32, 10);
 
                             cx.rebuild();
                             cx.draw();
@@ -283,7 +461,7 @@ fn curve_view(_eqo: &mut Freeq) -> impl View<Freeq> {
                     let rect = curve_view_rect(cx.rect());
 
                     if let Some(selected) = state.selected {
-                        let filter = &mut eqo.params.filters[selected];
+                        let filter = &mut data.params.filters[selected];
 
                         *filter.freq = x_to_freq(local.x, rect);
                         *filter.gain = y_to_gain(local.y, rect);
@@ -308,7 +486,7 @@ fn curve_view(_eqo: &mut Freeq) -> impl View<Freeq> {
 
                     let mut selected = None;
 
-                    for (i, filter) in eqo.params.filters.iter().enumerate() {
+                    for (i, filter) in data.params.filters.iter().enumerate() {
                         let center = filter_center(filter, rect);
 
                         if center.distance(local) < CONTROL_RADIUS {
@@ -318,7 +496,7 @@ fn curve_view(_eqo: &mut Freeq) -> impl View<Freeq> {
                     }
 
                     if let Some(selected) = selected {
-                        let filter = &mut eqo.params.filters[selected];
+                        let filter = &mut data.params.filters[selected];
 
                         *filter.q += e.delta.y * 0.1 * *filter.q;
                         *filter.q = filter.q.clamp(Filter::Q_MIN, Filter::Q_MAX);
@@ -329,9 +507,75 @@ fn curve_view(_eqo: &mut Freeq) -> impl View<Freeq> {
 
                     false
                 }
+                Event::Animate(_) => {
+                    cx.animate();
+                    cx.draw();
+
+                    true
+                }
                 _ => false,
-            },
-        )
+            }
+        })
+    })
+}
+
+fn filter_options(data: &mut Freeq, index: usize) -> impl View<Freeq> {
+    let filter = &mut data.params.filters[index];
+    let color = filter_color(index, 10);
+
+    let prev_kind = text("<").font_size(14.0);
+    let prev_kind = button(prev_kind).padding(2.0).color(Theme::SURFACE);
+    let prev_kind = on_click(prev_kind, move |cx, filter: &mut Filter| {
+        filter.kind = filter.kind.prev();
+
+        if !filter.kind.uses_gain() {
+            *filter.gain = 0.0;
+        }
+
+        cx.rebuild();
+        cx.draw();
+    });
+
+    let next_kind = text(">").font_size(14.0);
+    let next_kind = button(next_kind).padding(2.0).color(Theme::SURFACE);
+    let next_kind = on_click(next_kind, move |cx, filter: &mut Filter| {
+        filter.kind = filter.kind.next();
+
+        if !filter.kind.uses_gain() {
+            *filter.gain = 0.0;
+        }
+
+        cx.rebuild();
+        cx.draw();
+    });
+
+    let kind = text(filter.kind.abbreviation()).font_size(14.0);
+    let kind = hstack![prev_kind, kind, next_kind].justify(Justify::SpaceBetween);
+    let kind = width(FILL, pad([6.0, 0.0], kind));
+
+    let freq = match *filter.freq < 1000.0 {
+        true => format!("{:.0} Hz", *filter.freq),
+        false => format!("{:.1} kHz", *filter.freq / 1000.0),
+    };
+
+    let freq = text(freq).font_size(14.0);
+
+    let gain = text(format!("{:+.0} dB", *filter.gain)).font_size(14.0);
+
+    let q = text(format!("{:.2}", *filter.q)).font_size(14.0);
+
+    let view = vstack![kind, freq, gain, q].gap(2.0);
+
+    let view = pad([8.0, 2.0, 2.0, 2.0], view);
+    let view = container(view)
+        .border_width([6.0, 0.0, 0.0, 0.0])
+        .border_radius(2.0)
+        .border_color(color);
+
+    let view = width(64.0, view);
+
+    focus(view, move |data: &mut Freeq, lens| {
+        lens(&mut data.params.filters[index])
     })
 }
 
@@ -348,14 +592,19 @@ fn filter_color(index: usize, max: usize) -> Color {
     Color::okhsl(hue * 360.0, 0.8, 0.8)
 }
 
-fn freq_to_x(freq: f32, rect: Rect) -> f32 {
+fn freq_to_frac(freq: f32) -> f32 {
     let factor = f32::log2(Filter::FREQ_MAX / Filter::FREQ_MIN);
-    (f32::log2(freq) - Filter::FREQ_MIN.log2()) / factor * rect.width() + rect.min.x
+    (f32::log2(freq) - Filter::FREQ_MIN.log2()) / factor
 }
 
 fn frac_to_freq(frac: f32) -> f32 {
     let factor = f32::log2(Filter::FREQ_MAX / Filter::FREQ_MIN);
     f32::powf(2.0, frac * factor + Filter::FREQ_MIN.log2())
+}
+
+fn freq_to_x(freq: f32, rect: Rect) -> f32 {
+    let frac = freq_to_frac(freq);
+    rect.min.x + frac * rect.width()
 }
 
 fn x_to_freq(x: f32, rect: Rect) -> f32 {

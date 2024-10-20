@@ -244,6 +244,19 @@ pub enum FilterKind {
 impl FilterKind {
     pub const MAX_ID: u32 = 7;
 
+    pub fn abbreviation(&self) -> &str {
+        match self {
+            FilterKind::LowPass => "LP",
+            FilterKind::LowPass2 => "LP2",
+            FilterKind::LowShelf => "LS",
+            FilterKind::HighPass => "HP",
+            FilterKind::HighPass2 => "HP2",
+            FilterKind::HighShelf => "HS",
+            FilterKind::Peak => "PK",
+            FilterKind::Notch => "NT",
+        }
+    }
+
     pub fn uses_gain(&self) -> bool {
         match self {
             FilterKind::LowPass => false,
@@ -282,6 +295,18 @@ impl FilterKind {
             7 => Some(FilterKind::Notch),
             _ => None,
         }
+    }
+
+    pub fn prev(&self) -> FilterKind {
+        let id = self.id();
+        let prev_id = (id + Self::MAX_ID - 1) % Self::MAX_ID;
+        FilterKind::from_id(prev_id).unwrap()
+    }
+
+    pub fn next(&self) -> FilterKind {
+        let id = self.id();
+        let next_id = (id + 1) % Self::MAX_ID;
+        FilterKind::from_id(next_id).unwrap()
     }
 }
 
