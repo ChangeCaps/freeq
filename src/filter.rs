@@ -5,6 +5,7 @@ use ori_vst::prelude::*;
 
 #[derive(Params)]
 pub struct Filter {
+    pub enabled: Bool,
     pub freq: Float,
     pub gain: Float,
     pub q: Float,
@@ -40,17 +41,19 @@ impl Filter {
         };
 
         Filter {
+            enabled: Bool::new(true).name(format!("Enabled ({})", index)),
+
             freq: Float::new(freq, Self::FREQ_MIN..=Self::FREQ_MAX)
-                .with_name(format!("Frequency ({})", index))
-                .with_automate(),
+                .name(format!("Frequency ({})", index))
+                .automate(),
 
             gain: Float::new(0.0, Self::GAIN_MIN..=Self::GAIN_MAX)
-                .with_name(format!("Gain ({})", index))
-                .with_automate(),
+                .name(format!("Gain ({})", index))
+                .automate(),
 
             q: Float::new(default_q, Self::Q_MIN..=Self::Q_MAX)
-                .with_name(format!("Q ({})", index))
-                .with_automate(),
+                .name(format!("Q ({})", index))
+                .automate(),
 
             kind,
         }
@@ -65,6 +68,7 @@ impl Filter {
 
 #[derive(Default)]
 pub struct FilterState {
+    pub enabled: bool,
     pub b0: f32,
     pub b1: f32,
     pub b2: f32,
@@ -83,6 +87,7 @@ impl FilterState {
         let gain = *filter.gain;
         let q = *filter.q;
 
+        self.enabled = *filter.enabled;
         self.set_params_inner(freq, gain, q, filter.kind, sample_rate);
     }
 
@@ -299,13 +304,13 @@ impl FilterKind {
 
     pub fn prev(&self) -> FilterKind {
         let id = self.id();
-        let prev_id = (id + Self::MAX_ID - 1) % Self::MAX_ID;
+        let prev_id = (id + Self::MAX_ID) % (Self::MAX_ID + 1);
         FilterKind::from_id(prev_id).unwrap()
     }
 
     pub fn next(&self) -> FilterKind {
         let id = self.id();
-        let next_id = (id + 1) % Self::MAX_ID;
+        let next_id = (id + 1) % (Self::MAX_ID + 1);
         FilterKind::from_id(next_id).unwrap()
     }
 }

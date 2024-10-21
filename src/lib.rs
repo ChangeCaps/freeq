@@ -1,4 +1,8 @@
-use std::{f32::consts::PI, sync::Arc};
+use std::{
+    f32::consts::PI,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use filter::{Filter, FilterState};
 use num::Complex;
@@ -124,6 +128,10 @@ impl VstPlugin for Freeq {
 
             for (sample, filters) in samples.zip(self.filters.iter_mut()) {
                 for filter in filters.iter_mut() {
+                    if !filter.enabled {
+                        continue;
+                    }
+
                     *sample = filter.process(*sample);
                 }
 
@@ -222,12 +230,36 @@ const FREQ_LINES: &[f32] = &[
 ];
 
 const FREQ_TEXT: &[f32] = &[
-    20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0,
+    20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0,
 ];
 
 #[derive(Default)]
 struct CurveView {
     selected: Option<usize>,
+    last_click: Option<Instant>,
+}
+
+impl CurveView {
+    fn is_double_click(&mut self) -> bool {
+        match self.last_click {
+            Some(last_click) => {
+                let now = Instant::now();
+                let elapsed = now.duration_since(last_click);
+
+                if elapsed < Duration::from_millis(500) {
+                    self.last_click = None;
+                    true
+                } else {
+                    self.last_click = Some(now);
+                    false
+                }
+            }
+            None => {
+                self.last_click = Some(Instant::now());
+                false
+            }
+        }
+    }
 }
 
 fn curve_view(_data: &mut Freeq) -> impl View<Freeq> {
@@ -240,7 +272,7 @@ fn curve_view(_data: &mut Freeq) -> impl View<Freeq> {
 
             let rect = curve_view_rect(cx.rect());
 
-            for &gain in GAIN_LINES {
+            for (i, &gain) in GAIN_LINES.iter().enumerate() {
                 let y = gain_to_y(gain, rect);
 
                 let mut curve = Curve::default();
@@ -253,7 +285,10 @@ fn curve_view(_data: &mut Freeq) -> impl View<Freeq> {
 
                 text.set_text(cx.fonts(), &format!("{:+.0} dB", gain), Default::default());
 
-                let text_offset = Vector::new(rect.max.x + 8.0, y - 6.0);
+                let text_offset = match i > 0 {
+                    true => Vector::new(rect.max.x + 8.0, y - 6.0),
+                    false => Vector::new(rect.max.x + 8.0, y - 8.0),
+                };
 
                 cx.text(&text, label_color, text_offset);
             }
@@ -280,7 +315,7 @@ fn curve_view(_data: &mut Freeq) -> impl View<Freeq> {
 
                 buffer.set_text(cx.fonts(), &text, Default::default());
 
-                let text_offset = Vector::new(x, rect.max.y + 12.0);
+                let text_offset = Vector::new(x - 8.0, rect.max.y + 8.0);
 
                 cx.text(&buffer, label_color, text_offset);
             }
@@ -366,7 +401,10 @@ fn curve_view(_data: &mut Freeq) -> impl View<Freeq> {
 
                     let color = filter_color(i, 10);
 
-                    cx.fill(curve, FillRule::NonZero, color.fade(0.3));
+                    match *filter.enabled {
+                        true => cx.fill(curve, FillRule::NonZero, color.fade(0.4)),
+                        false => cx.fill(curve, FillRule::NonZero, color.fade(0.3).desaturate(0.3)),
+                    }
                 }
 
                 let mut curve = Curve::default();
@@ -380,6 +418,10 @@ fn curve_view(_data: &mut Freeq) -> impl View<Freeq> {
                     let mut gain = 0.0;
 
                     for filter in data.params.filters.iter() {
+                        if !*filter.enabled {
+                            continue;
+                        }
+
                         gain += filter.gain_at(freq, 24000.0 + frac * 24000.0);
                     }
 
@@ -396,9 +438,13 @@ fn curve_view(_data: &mut Freeq) -> impl View<Freeq> {
 
                 cx.stroke(curve, 2.0, contrast_color);
 
-                for (i, filter) in data.params.filters.iter_mut().enumerate() {
+                for (i, filter) in data.params.filters.iter_mut().enumerate().rev() {
                     let center = filter_center(filter, rect);
-                    let color = filter_color(i, 10);
+
+                    let color = match *filter.enabled {
+                        true => filter_color(i, 10),
+                        false => filter_color(i, 10).desaturate(0.5),
+                    };
 
                     cx.fill(
                         Curve::circle(center, CONTROL_RADIUS),
@@ -443,10 +489,22 @@ fn curve_view(_data: &mut Freeq) -> impl View<Freeq> {
                     match e.button {
                         PointerButton::Primary => {
                             state.selected = Some(selected);
+
+                            if state.is_double_click() {
+                                data.params.filters[selected] = Filter::new(selected as u32, 10);
+
+                                cx.rebuild();
+                                cx.draw();
+
+                                state.selected = None;
+                            }
+
                             true
                         }
                         PointerButton::Secondary => {
-                            data.params.filters[selected] = Filter::new(selected as u32, 10);
+                            let filter = &mut data.params.filters[selected];
+
+                            *filter.enabled = !*filter.enabled;
 
                             cx.rebuild();
                             cx.draw();
@@ -479,7 +537,9 @@ fn curve_view(_data: &mut Freeq) -> impl View<Freeq> {
 
                     false
                 }
-                Event::PointerReleased(_) => state.selected.take().is_some(),
+                Event::PointerReleased(e) if e.button == PointerButton::Primary => {
+                    state.selected.take().is_some()
+                }
                 Event::PointerScrolled(e) => {
                     let local = cx.local(e.position);
                     let rect = curve_view_rect(cx.rect());
@@ -521,7 +581,10 @@ fn curve_view(_data: &mut Freeq) -> impl View<Freeq> {
 
 fn filter_options(data: &mut Freeq, index: usize) -> impl View<Freeq> {
     let filter = &mut data.params.filters[index];
-    let color = filter_color(index, 10);
+    let color = match *filter.enabled {
+        true => filter_color(index, 10),
+        false => filter_color(index, 10).darken(0.5).desaturate(0.5),
+    };
 
     let prev_kind = text("<").font_size(14.0);
     let prev_kind = button(prev_kind).padding(2.0).color(Theme::SURFACE);
@@ -581,8 +644,8 @@ fn filter_options(data: &mut Freeq, index: usize) -> impl View<Freeq> {
 
 fn curve_view_rect(rect: Rect) -> Rect {
     Rect::new(
-        rect.min + Vector::all(12.0),
-        rect.max - Vector::new(50.0, 30.0),
+        rect.min + Vector::all(18.0),
+        rect.max - Vector::new(54.0, 30.0),
     )
 }
 
